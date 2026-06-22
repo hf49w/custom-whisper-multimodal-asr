@@ -145,9 +145,15 @@ class Inference:
 
 
 class PyTorchInference(Inference):
-    def __init__(self, model: "Whisper", initial_token_length: int):
+    def __init__(
+        self,
+        model: "Whisper",
+        initial_token_length: int,
+        prefix_insert_pos: Optional[int] = None,
+    ):
         self.model: "Whisper" = model
         self.initial_token_length = initial_token_length
+        self.prefix_insert_pos = prefix_insert_pos
         self.kv_cache = {}
         self.hooks = []
 
@@ -168,7 +174,9 @@ class PyTorchInference(Inference):
         prefix_insert_pos = None
         if first_pass and hasattr(self.model, "get_decoder_prefix"):
             prefix_embeds = self.model.get_decoder_prefix(tokens.shape[0])
-            if hasattr(self.model, "decoder_prefix_insert_pos"):
+            if self.prefix_insert_pos is not None:
+                prefix_insert_pos = min(self.prefix_insert_pos, tokens.shape[-1])
+            elif hasattr(self.model, "decoder_prefix_insert_pos"):
                 prefix_insert_pos = self.model.decoder_prefix_insert_pos(tokens)
 
         return self.model.decoder(
@@ -567,7 +575,20 @@ class DecodingTask:
         self.sot_index: int = self.initial_tokens.index(tokenizer.sot)
 
         # inference: implements the forward pass through the decoder, including kv caching
-        self.inference = PyTorchInference(model, len(self.initial_tokens))
+        decoder_prefix_insert_pos = None
+        if (
+            getattr(model, "fusion_location", None) == "decoder_prefix"
+            and getattr(model, "decoder_prompt_insert", None) == "after_special_tokens"
+        ):
+            # initial_tokens may start with sot_prev + a text prompt. sot_index locates
+            # the actual Whisper SOT sequence; image prompts belong after that complete
+            # special-token sequence and before user-provided text prefix tokens.
+            decoder_prefix_insert_pos = self.sot_index + len(self.sot_sequence)
+        self.inference = PyTorchInference(
+            model,
+            len(self.initial_tokens),
+            prefix_insert_pos=decoder_prefix_insert_pos,
+        )
 
         # sequence ranker: implements how to rank a group of sampled sequences
         self.sequence_ranker = MaximumLikelihoodRanker(options.length_penalty)

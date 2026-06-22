@@ -48,23 +48,32 @@ independent experiment IDs with different externally assigned `DEVICE` or
 
 - Prefix: `--fusion-location`, `--decoder-prompt-adapter`,
   `--decoder-prompt-len`, `--decoder-prompt-heads`,
-  `--decoder-prompt-dropout`, `--decoder-prompt-insert`, and
-  `--decoder-prompt-missing`.
+  `--decoder-prompt-dropout`, `--decoder-prompt-insert`,
+  `--decoder-prompt-special-tokens`, and `--decoder-prompt-missing`.
+  For `after_special_tokens`, the default `-1` resolves to the exact length of
+  `sot_sequence_including_notimestamps` (or `sot_sequence`). During decoding the
+  insertion point is computed as `sot_index + len(sot_sequence)`, so an
+  `sot_prev` prompt does not shift the image prefix into user text.
 - Freezing: `--freeze-whisper`, `--freeze-visual-encoder` and their `--no-*`
   counterparts.
 - Ranking: `--loss-rank-shuffle`, `--loss-rank-weight`,
   `--loss-rank-margin`.
 - Token weighting: `--visual-token-weighting none|pos` and
-  `--visual-token-weight`. POS mode uses `visual_pos_mask` when supplied by a
-  dataset; otherwise it intentionally falls back to unit weights.
+  `--visual-token-weight`. POS mode requires every manifest row to contain a
+  `visual_pos_mask` JSON/array aligned with the encoded label positions. Missing
+  masks raise an error. Unit-weight fallback is available only when explicitly
+  requested with `--allow-missing-visual-pos-mask`.
 - LoRA: `--enable-decoder-lora`, `--lora-rank`, `--lora-alpha`,
   `--lora-dropout`, `--lora-last-n-layers`, and `--lora-targets`.
 - Local-only models: `--no-download`, `--clip-model-name`, and
   `--blip2-model-name`.
 
 Diagnostics are available in `eval_visspeech_custom_whisper_fuser.py` via
-`--shuffle-images-at-eval`, `--blank-prefix-at-eval`, and
-`--disable-image-at-eval`.
+`--shuffle-images-at-eval`, `--zero-prefix-at-eval`,
+`--use-trained-blank-prefix-at-eval`, and `--disable-image-at-eval`. Zero prefix
+uses all-zero embeddings. Trained blank prefix is accepted only for an A1-style
+checkpoint whose adapter is `blank_prefix`. The old hidden
+`--blank-prefix-at-eval` alias retains its former zero-prefix behavior.
 
 ## CLIP reranking
 

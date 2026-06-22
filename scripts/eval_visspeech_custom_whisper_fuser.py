@@ -121,7 +121,22 @@ def parse_args() -> argparse.Namespace:
         help="Disable both image fusion and decoder image prefix.",
     )
     parser.add_argument("--shuffle-images-at-eval", action="store_true")
-    parser.add_argument("--blank-prefix-at-eval", action="store_true")
+    parser.add_argument(
+        "--zero-prefix-at-eval",
+        action="store_true",
+        help="Replace the decoder image prefix with all-zero embeddings.",
+    )
+    parser.add_argument(
+        "--use-trained-blank-prefix-at-eval",
+        action="store_true",
+        help="Use the learned BlankDecoderPrefix from an A1-style checkpoint.",
+    )
+    parser.add_argument(
+        "--blank-prefix-at-eval",
+        dest="zero_prefix_at_eval",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--beam-size", type=int, default=5)
     parser.set_defaults(no_download=True)
     parser.add_argument("--no-download", dest="no_download", action="store_true")
@@ -150,6 +165,12 @@ def rebuild_model(
     checkpoint: Dict[str, Any], device: torch.device, *, no_download: bool = True
 ) -> custom_whisper.AudioImageWhisper:
     config = checkpoint["train_config"]
+    special_token_count = config.get(
+        "resolved_decoder_prompt_special_tokens",
+        config.get("decoder_prompt_special_tokens"),
+    )
+    if special_token_count is not None and int(special_token_count) < 0:
+        special_token_count = None
     model = custom_whisper.load_audio_image_model(
         config["whisper_model"],
         device=device,
@@ -176,6 +197,7 @@ def rebuild_model(
         decoder_prompt_heads=config.get("decoder_prompt_heads", 8),
         decoder_prompt_dropout=config.get("decoder_prompt_dropout", 0.1),
         decoder_prompt_insert=config.get("decoder_prompt_insert", "before_tokens"),
+        decoder_prompt_special_tokens=special_token_count,
         decoder_prompt_missing=config.get("decoder_prompt_missing", "audio_only"),
         blip2_model_name=config.get("blip2_model_name", ""),
         freeze_whisper=True,
@@ -202,11 +224,15 @@ def rebuild_model(
 def main() -> None:
     args = parse_args()
     diagnostic_count = sum(
-        [args.disable_image_at_eval, args.shuffle_images_at_eval, args.blank_prefix_at_eval]
+        [
+            args.disable_image_at_eval,
+            args.shuffle_images_at_eval,
+            args.zero_prefix_at_eval,
+            args.use_trained_blank_prefix_at_eval,
+        ]
     )
     if diagnostic_count > 1:
         raise ValueError("Choose only one image diagnostic mode at a time")
-    use_images = not args.disable_image_at_eval and not args.blank_prefix_at_eval
     checkpoint_path = resolve_cross_platform_path(args.checkpoint_path)
     manifest_path = resolve_cross_platform_path(args.manifest_path)
     output_root = resolve_cross_platform_path(args.output_root)
@@ -241,6 +267,25 @@ def main() -> None:
         rows = [dict(row, image_path=image_path) for row, image_path in zip(rows, shuffled_paths)]
 
     model = rebuild_model(checkpoint, device=device, no_download=args.no_download)
+    if args.zero_prefix_at_eval and model.fusion_location != "decoder_prefix":
+        raise ValueError("--zero-prefix-at-eval requires fusion_location='decoder_prefix'")
+    if (
+        args.use_trained_blank_prefix_at_eval
+        and (
+            model.fusion_location != "decoder_prefix"
+            or model.decoder_prompt_adapter_name != "blank_prefix"
+        )
+    ):
+        raise ValueError(
+            "--use-trained-blank-prefix-at-eval requires an A1-style checkpoint "
+            "with decoder_prompt_adapter='blank_prefix'"
+        )
+    use_images = not (
+        args.disable_image_at_eval
+        or args.zero_prefix_at_eval
+        or args.use_trained_blank_prefix_at_eval
+        or model.decoder_prompt_adapter_name == "blank_prefix"
+    )
     parameter_summary = model.trainable_parameter_summary()
     print(
         "[INFO] multimodal_config="
@@ -254,9 +299,22 @@ def main() -> None:
         f"trainable_params={parameter_summary['trainable_params']}"
     )
     tokenizer, prefix_tokens = build_tokenizer_and_prefix(model)
+    if model.decoder_prompt_special_tokens is None:
+        model.set_decoder_prompt_special_token_count(len(prefix_tokens))
+    available_text_ctx = model.dims.n_text_ctx - (
+        model.decoder_prompt_len
+        if model.fusion_location == "decoder_prefix"
+        and model.visual_prompt_adapter is not None
+        else 0
+    )
+    if available_text_ctx <= len(prefix_tokens):
+        raise ValueError(
+            f"decoder prompt leaves only {available_text_ctx} text positions, but "
+            f"the Whisper special-token prefix needs {len(prefix_tokens)}"
+        )
     batch_config = BatchEncodingConfig(
         n_mels=model.dims.n_mels,
-        max_text_ctx=model.dims.n_text_ctx,
+        max_text_ctx=available_text_ctx,
         pad_token_id=tokenizer.eot,
         prefix_tokens=prefix_tokens,
         tokenizer=tokenizer,
@@ -283,7 +341,13 @@ def main() -> None:
         else None
     )
     prefix_override = (
-        "disabled" if args.disable_image_at_eval else "blank" if args.blank_prefix_at_eval else None
+        "disabled"
+        if args.disable_image_at_eval
+        else "zero"
+        if args.zero_prefix_at_eval
+        else "trained_blank"
+        if args.use_trained_blank_prefix_at_eval
+        else None
     )
     context = (
         model.use_decoder_prefix_override(prefix_override)
@@ -329,7 +393,10 @@ def main() -> None:
         "rows": len(rows),
         "use_images": use_images,
         "shuffle_images_at_eval": bool(args.shuffle_images_at_eval),
-        "blank_prefix_at_eval": bool(args.blank_prefix_at_eval),
+        "zero_prefix_at_eval": bool(args.zero_prefix_at_eval),
+        "use_trained_blank_prefix_at_eval": bool(
+            args.use_trained_blank_prefix_at_eval
+        ),
         "disable_image_at_eval": bool(args.disable_image_at_eval),
         "avg_loss": avg_loss,
         "wer": metric_summary["wer"],

@@ -43,7 +43,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not pass the image. Useful as an ablation baseline.",
     )
-    parser.add_argument("--blank-prefix-at-eval", action="store_true")
+    parser.add_argument("--zero-prefix-at-eval", action="store_true")
+    parser.add_argument("--use-trained-blank-prefix-at-eval", action="store_true")
+    parser.add_argument(
+        "--blank-prefix-at-eval",
+        dest="zero_prefix_at_eval",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     parser.set_defaults(no_download=True)
     parser.add_argument("--no-download", dest="no_download", action="store_true")
     parser.add_argument("--allow-download", dest="no_download", action="store_false")
@@ -82,6 +89,12 @@ def rebuild_model(
     no_download: bool = True,
 ) -> custom_whisper.AudioImageWhisper:
     config = checkpoint["train_config"]
+    special_token_count = config.get(
+        "resolved_decoder_prompt_special_tokens",
+        config.get("decoder_prompt_special_tokens"),
+    )
+    if special_token_count is not None and int(special_token_count) < 0:
+        special_token_count = None
     model = custom_whisper.load_audio_image_model(
         whisper_model,
         device=device,
@@ -108,6 +121,7 @@ def rebuild_model(
         decoder_prompt_heads=config.get("decoder_prompt_heads", 8),
         decoder_prompt_dropout=config.get("decoder_prompt_dropout", 0.1),
         decoder_prompt_insert=config.get("decoder_prompt_insert", "before_tokens"),
+        decoder_prompt_special_tokens=special_token_count,
         decoder_prompt_missing=config.get("decoder_prompt_missing", "audio_only"),
         blip2_model_name=config.get("blip2_model_name", ""),
         freeze_whisper=True,
@@ -130,6 +144,8 @@ def rebuild_model(
 
 def main() -> None:
     args = parse_args()
+    if sum([args.audio_only, args.zero_prefix_at_eval, args.use_trained_blank_prefix_at_eval]) > 1:
+        raise ValueError("Choose only one audio/prefix diagnostic mode")
     checkpoint_path = require_file(args.checkpoint_path, "Checkpoint")
     audio_path = require_file(args.audio_path, "Audio")
     image_path = require_file(args.image_path, "Image") if args.image_path else None
@@ -160,6 +176,18 @@ def main() -> None:
         clip_model_name=clip_model_name,
         no_download=args.no_download,
     )
+    if args.zero_prefix_at_eval and model.fusion_location != "decoder_prefix":
+        raise ValueError("--zero-prefix-at-eval requires fusion_location='decoder_prefix'")
+    if (
+        args.use_trained_blank_prefix_at_eval
+        and (
+            model.fusion_location != "decoder_prefix"
+            or model.decoder_prompt_adapter_name != "blank_prefix"
+        )
+    ):
+        raise ValueError(
+            "--use-trained-blank-prefix-at-eval requires decoder_prompt_adapter='blank_prefix'"
+        )
     transcribe_options: Dict[str, Any] = {
         "language": args.language,
         "task": args.task,
@@ -168,18 +196,32 @@ def main() -> None:
     }
     if args.initial_prompt:
         transcribe_options["initial_prompt"] = args.initial_prompt
-    if not args.audio_only and not args.blank_prefix_at_eval:
-        if image_path is None and config.get("decoder_prompt_adapter") != "blank_prefix":
+    no_image_mode = (
+        args.audio_only
+        or args.zero_prefix_at_eval
+        or args.use_trained_blank_prefix_at_eval
+        or model.decoder_prompt_adapter_name == "blank_prefix"
+    )
+    if not no_image_mode:
+        if image_path is None:
             raise ValueError("--image-path is required unless audio-only/blank-prefix mode is used")
-    if not args.audio_only and not args.blank_prefix_at_eval and image_path is not None:
+    if not no_image_mode and image_path is not None:
         transcribe_options["image"] = str(image_path)
-    override = "blank" if args.blank_prefix_at_eval else "disabled" if args.audio_only else None
+    override = (
+        "disabled"
+        if args.audio_only
+        else "zero"
+        if args.zero_prefix_at_eval
+        else "trained_blank"
+        if args.use_trained_blank_prefix_at_eval
+        else None
+    )
     with model.use_decoder_prefix_override(override):
         result = model.transcribe(str(audio_path), **transcribe_options)
     payload = {
         "text": str(result.get("text", "")).strip(),
         "audio_path": str(audio_path),
-        "image_path": "" if image_path is None or args.audio_only else str(image_path),
+        "image_path": "" if image_path is None or no_image_mode else str(image_path),
         "audio_only": bool(args.audio_only),
         "checkpoint_path": str(checkpoint_path),
         "whisper_model": whisper_model,

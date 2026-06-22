@@ -7,7 +7,10 @@ import torch
 from custom_whisper.model import AudioImageWhisper, LoRALinear, ModelDimensions, TextDecoder
 from custom_whisper.decoding import PyTorchInference
 from custom_whisper.multimodal import AbsEncoderVisual, VisualPromptAdapter
-from scripts.visspeech_custom_whisper_utils import forward_multimodal_loss
+from scripts.visspeech_custom_whisper_utils import (
+    forward_multimodal_loss,
+    visual_token_loss_weights,
+)
 
 
 class DummyVisualEncoder(AbsEncoderVisual):
@@ -85,6 +88,36 @@ class DecoderPrefixSmokeTest(unittest.TestCase):
         self.assertGreater(summary["adapter_params"], 0)
         self.assertTrue(model.visual_prompt_adapter.prefix.requires_grad)
         self.assertTrue(all(not p.requires_grad for p in model.encoder.parameters()))
+
+    def test_after_special_tokens_uses_explicit_prefix_length(self):
+        model = AudioImageWhisper(
+            self.dims,
+            visual_encoder="none",
+            feature_fuser="select_speech",
+            fusion_location="decoder_prefix",
+            decoder_prompt_adapter="blank_prefix",
+            decoder_prompt_insert="after_special_tokens",
+            decoder_prompt_special_tokens=4,
+        )
+        self.assertEqual(model.decoder_prefix_insert_pos(self.tokens), 4)
+        model.set_decoder_prompt_special_token_count(3)
+        self.assertEqual(model.decoder_prefix_insert_pos(self.tokens), 3)
+
+    def test_zero_and_trained_blank_prefix_are_distinct(self):
+        model = AudioImageWhisper(
+            self.dims,
+            visual_encoder="none",
+            feature_fuser="select_speech",
+            fusion_location="decoder_prefix",
+            decoder_prompt_adapter="blank_prefix",
+            decoder_prompt_len=3,
+        )
+        with torch.no_grad():
+            model.visual_prompt_adapter.prefix.fill_(1.0)
+        with model.use_decoder_prefix_override("zero"):
+            self.assertTrue(torch.equal(model.get_decoder_prefix(2), torch.zeros(2, 3, 8)))
+        with model.use_decoder_prefix_override("trained_blank"):
+            self.assertTrue(torch.equal(model.get_decoder_prefix(2), torch.ones(2, 3, 8)))
 
     def test_resampler_accepts_mock_sequence_features(self):
         adapter = VisualPromptAdapter(6, self.dims.n_text_state, 16, 2, 0.0)
@@ -186,6 +219,18 @@ class DecoderPrefixSmokeTest(unittest.TestCase):
         self.assertTrue(
             any(parameter.grad is not None for parameter in model.visual_prompt_adapter.parameters())
         )
+
+    def test_pos_weighting_requires_explicit_mask(self):
+        labels = torch.tensor([[1, 2, -100]])
+        with self.assertRaisesRegex(ValueError, "requires a precomputed visual_pos_mask"):
+            visual_token_loss_weights(labels, mode="pos", pos_mask=None)
+        weights = visual_token_loss_weights(
+            labels,
+            mode="pos",
+            visual_token_weight=1.5,
+            pos_mask=torch.tensor([[False, True, False]]),
+        )
+        self.assertEqual(weights.tolist(), [[1.0, 1.5, 1.0]])
 
     def test_legacy_encoder_memory_path(self):
         model = AudioImageWhisper(

@@ -566,6 +566,7 @@ class AudioImageWhisper(Whisper):
         decoder_prompt_heads: int = 8,
         decoder_prompt_dropout: float = 0.1,
         decoder_prompt_insert: str = "before_tokens",
+        decoder_prompt_special_tokens: Optional[int] = None,
         decoder_prompt_missing: str = "audio_only",
         blip2_model_name: str = "",
         freeze_visual_encoder: bool = False,
@@ -589,6 +590,9 @@ class AudioImageWhisper(Whisper):
         self.decoder_prompt_adapter_name = decoder_prompt_adapter
         self.decoder_prompt_len = decoder_prompt_len
         self.decoder_prompt_insert = decoder_prompt_insert
+        if decoder_prompt_special_tokens is not None and decoder_prompt_special_tokens < 0:
+            raise ValueError("decoder_prompt_special_tokens must be non-negative or None")
+        self.decoder_prompt_special_tokens = decoder_prompt_special_tokens
         self.decoder_prompt_missing = decoder_prompt_missing
         self.freeze_visual_encoder = freeze_visual_encoder
         self.freeze_whisper = freeze_whisper
@@ -617,6 +621,7 @@ class AudioImageWhisper(Whisper):
             "decoder_prompt_heads": decoder_prompt_heads,
             "decoder_prompt_dropout": decoder_prompt_dropout,
             "decoder_prompt_insert": decoder_prompt_insert,
+            "decoder_prompt_special_tokens": decoder_prompt_special_tokens,
             "decoder_prompt_missing": decoder_prompt_missing,
             "blip2_model_name": blip2_model_name,
             "freeze_visual_encoder": freeze_visual_encoder,
@@ -854,13 +859,20 @@ class AudioImageWhisper(Whisper):
         override = self._visual_context.get("prefix_override")
         if override == "disabled":
             return None
-        if override == "blank":
+        if override == "zero":
             return torch.zeros(
                 batch_size,
                 self.decoder_prompt_len,
                 self.dims.n_text_state,
                 device=self.device,
             )
+        if override == "trained_blank":
+            if not isinstance(self.visual_prompt_adapter, BlankDecoderPrefix):
+                raise ValueError(
+                    "trained blank-prefix evaluation requires a checkpoint configured "
+                    "with decoder_prompt_adapter='blank_prefix'"
+                )
+            return self.visual_prompt_adapter(batch_size)
         if self.visual_prompt_adapter is None:
             return None
         if isinstance(self.visual_prompt_adapter, BlankDecoderPrefix):
@@ -884,18 +896,43 @@ class AudioImageWhisper(Whisper):
         prefix = self.visual_prompt_adapter(visual_features)
         return self.maybe_expand_prefix(prefix, batch_size)
 
-    def decoder_prefix_insert_pos(self, tokens: Tensor) -> int:
+    def set_decoder_prompt_special_token_count(self, count: int) -> None:
+        """Set the exact number of leading Whisper special tokens in training inputs."""
+
+        if count < 0:
+            raise ValueError("Special-token prefix length must be non-negative")
+        self.decoder_prompt_special_tokens = int(count)
+        self.visual_config["decoder_prompt_special_tokens"] = int(count)
+
+    def decoder_prefix_insert_pos(
+        self,
+        tokens: Tensor,
+        special_token_count: Optional[int] = None,
+    ) -> int:
         """Resolve the configured soft-prompt insertion position."""
 
         if self.decoder_prompt_insert == "before_tokens":
             return 0
-        return min(1, tokens.shape[-1])
+        count = (
+            self.decoder_prompt_special_tokens
+            if special_token_count is None
+            else int(special_token_count)
+        )
+        if count is None:
+            raise ValueError(
+                "decoder_prompt_insert='after_special_tokens' requires an explicit "
+                "special-token prefix length. Set decoder_prompt_special_tokens or "
+                "pass special_token_count from the tokenizer/decode task."
+            )
+        if count < 0:
+            raise ValueError("special_token_count must be non-negative")
+        return min(count, tokens.shape[-1])
 
     @contextmanager
     def use_decoder_prefix_override(self, mode: Optional[str]):
         """Temporarily disable or zero the decoder prefix for diagnostics."""
 
-        if mode not in {None, "disabled", "blank"}:
+        if mode not in {None, "disabled", "zero", "trained_blank"}:
             raise ValueError(f"Unsupported prefix override: {mode}")
         previous_context = dict(self._visual_context)
         if mode is not None:
@@ -976,11 +1013,21 @@ class AudioImageWhisper(Whisper):
         """Return logits with the active visual prefix, including language ID calls."""
 
         prefix = self.get_decoder_prefix(tokens.shape[0])
+        partial_special_count = (
+            tokens.shape[-1]
+            if (
+                self.decoder_prompt_insert == "after_special_tokens"
+                and self.decoder_prompt_special_tokens is None
+            )
+            else None
+        )
         return self.decoder(
             tokens,
             audio_features,
             prefix_embeds=prefix,
-            prefix_insert_pos=self.decoder_prefix_insert_pos(tokens),
+            prefix_insert_pos=self.decoder_prefix_insert_pos(
+                tokens, special_token_count=partial_special_count
+            ),
         )
 
     def transcribe(

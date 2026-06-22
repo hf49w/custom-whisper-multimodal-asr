@@ -360,6 +360,7 @@ def collate_supervised_batch(
     keys: List[str] = []
     wav_paths: List[str] = []
     image_paths: List[str] = []
+    visual_pos_masks: List[Optional[torch.Tensor]] = []
 
     for row in rows:
         wav_path = str(row["wav_path"])
@@ -375,6 +376,25 @@ def collate_supervised_batch(
             prefix_tokens=config.prefix_tokens,
             max_text_ctx=config.max_text_ctx,
         )
+        raw_visual_pos_mask = row.get("visual_pos_mask")
+        if isinstance(raw_visual_pos_mask, str) and raw_visual_pos_mask.strip():
+            try:
+                raw_visual_pos_mask = json.loads(raw_visual_pos_mask)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"visual_pos_mask for {wav_path} must be a JSON boolean/0-1 list"
+                ) from exc
+        if raw_visual_pos_mask is None or (
+            isinstance(raw_visual_pos_mask, str) and not raw_visual_pos_mask.strip()
+        ):
+            visual_pos_mask = None
+        else:
+            visual_pos_mask = torch.as_tensor(raw_visual_pos_mask, dtype=torch.bool).flatten()
+            if visual_pos_mask.numel() != token_labels.numel():
+                raise ValueError(
+                    f"visual_pos_mask for {wav_path} has length {visual_pos_mask.numel()}, "
+                    f"expected {token_labels.numel()} aligned label positions"
+                )
 
         mels.append(mel)
         input_tokens.append(token_ids)
@@ -383,6 +403,7 @@ def collate_supervised_batch(
         keys.append(str(row.get("key") or row.get("utt_id") or Path(wav_path).stem))
         wav_paths.append(wav_path)
         image_paths.append(image_path)
+        visual_pos_masks.append(visual_pos_mask)
 
     mel_batch = torch.stack(mels, dim=0)
     max_token_len = max(t.shape[0] for t in input_tokens)
@@ -401,7 +422,7 @@ def collate_supervised_batch(
         tokens_batch[row_index, : token_ids.shape[0]] = token_ids
         labels_batch[row_index, : token_labels.shape[0]] = token_labels
 
-    return {
+    batch = {
         "mel": mel_batch,
         "input_tokens": tokens_batch,
         "labels": labels_batch,
@@ -410,6 +431,16 @@ def collate_supervised_batch(
         "wav_paths": wav_paths,
         "image_paths": image_paths,
     }
+    if any(mask is not None for mask in visual_pos_masks):
+        pos_mask_batch = torch.zeros_like(labels_batch, dtype=torch.bool)
+        pos_mask_available = torch.zeros(len(rows), dtype=torch.bool)
+        for row_index, mask in enumerate(visual_pos_masks):
+            if mask is not None:
+                pos_mask_batch[row_index, : mask.numel()] = mask
+                pos_mask_available[row_index] = True
+        batch["visual_pos_mask"] = pos_mask_batch
+        batch["visual_pos_mask_available"] = pos_mask_available
+    return batch
 
 
 def configure_multimodal_training(
@@ -492,10 +523,15 @@ def visual_token_loss_weights(
 ) -> torch.Tensor:
     """Build optional token weights; POS mode falls back cleanly without POS data."""
 
-    if mode == "none" or pos_mask is None:
+    if mode == "none":
         return torch.ones_like(labels, dtype=torch.float32)
     if mode != "pos":
         raise ValueError(f"Unsupported visual token weighting mode: {mode}")
+    if pos_mask is None:
+        raise ValueError(
+            "visual_token_weighting='pos' requires a precomputed visual_pos_mask "
+            "aligned with label positions"
+        )
     if pos_mask.shape != labels.shape:
         raise ValueError("pos_mask must have the same shape as labels")
     weights = torch.ones_like(labels, dtype=torch.float32)
@@ -514,6 +550,7 @@ def forward_multimodal_loss(
     loss_rank_margin: float = 0.2,
     visual_token_weighting: str = "none",
     visual_token_weight: float = 1.5,
+    allow_missing_visual_pos_mask: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """Compute ASR loss and optional true-vs-shuffled image ranking loss."""
 
@@ -567,9 +604,24 @@ def forward_multimodal_loss(
     pos_mask = batch.get("visual_pos_mask")
     if pos_mask is not None:
         pos_mask = pos_mask.to(device)
+    effective_weighting = visual_token_weighting
+    if visual_token_weighting == "pos":
+        available = batch.get("visual_pos_mask_available")
+        all_available = bool(
+            available is not None and torch.as_tensor(available).bool().all().item()
+        )
+        if pos_mask is None or not all_available:
+            if not allow_missing_visual_pos_mask:
+                raise ValueError(
+                    "visual_token_weighting='pos' was enabled, but one or more rows "
+                    "lack visual_pos_mask. Add aligned masks to the manifest or pass "
+                    "--allow-missing-visual-pos-mask for an explicit unit-weight fallback."
+                )
+            effective_weighting = "none"
+            pos_mask = None
     token_weights = visual_token_loss_weights(
         labels,
-        mode=visual_token_weighting,
+        mode=effective_weighting,
         visual_token_weight=visual_token_weight,
         pos_mask=pos_mask,
     )

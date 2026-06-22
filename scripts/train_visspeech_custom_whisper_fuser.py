@@ -76,6 +76,7 @@ RESUME_COMPAT_KEYS = (
     "decoder_prompt_heads",
     "decoder_prompt_dropout",
     "decoder_prompt_insert",
+    "decoder_prompt_special_tokens",
     "decoder_prompt_missing",
     "enable_decoder_lora",
     "lora_rank",
@@ -88,6 +89,7 @@ RESUME_COMPAT_KEYS = (
     "loss_rank_margin",
     "visual_token_weighting",
     "visual_token_weight",
+    "allow_missing_visual_pos_mask",
 )
 
 LEGACY_RESUME_DEFAULTS = {
@@ -105,6 +107,7 @@ LEGACY_RESUME_DEFAULTS = {
     "decoder_prompt_heads": 8,
     "decoder_prompt_dropout": 0.1,
     "decoder_prompt_insert": "before_tokens",
+    "decoder_prompt_special_tokens": -1,
     "decoder_prompt_missing": "audio_only",
     "enable_decoder_lora": False,
     "lora_rank": 4,
@@ -117,6 +120,7 @@ LEGACY_RESUME_DEFAULTS = {
     "loss_rank_margin": 0.2,
     "visual_token_weighting": "none",
     "visual_token_weight": 1.5,
+    "allow_missing_visual_pos_mask": False,
 }
 
 RELOCATABLE_PATH_KEYS = {
@@ -317,6 +321,15 @@ def parse_args() -> argparse.Namespace:
         default="before_tokens",
     )
     parser.add_argument(
+        "--decoder-prompt-special-tokens",
+        type=int,
+        default=-1,
+        help=(
+            "Number of leading special tokens before decoder prompts. -1 resolves "
+            "to len(tokenizer.sot_sequence[_including_notimestamps])."
+        ),
+    )
+    parser.add_argument(
         "--decoder-prompt-missing",
         choices=["audio_only", "error"],
         default="audio_only",
@@ -333,6 +346,11 @@ def parse_args() -> argparse.Namespace:
         "--visual-token-weighting", choices=["none", "pos"], default="none"
     )
     parser.add_argument("--visual-token-weight", type=float, default=1.5)
+    parser.add_argument(
+        "--allow-missing-visual-pos-mask",
+        action="store_true",
+        help="Explicitly permit POS weighting to fall back to unit weights when masks are missing.",
+    )
     parser.add_argument("--enable-decoder-lora", action="store_true")
     parser.add_argument("--lora-rank", type=int, default=4)
     parser.add_argument("--lora-alpha", type=float, default=16.0)
@@ -513,6 +531,7 @@ def build_resume_compat_config(
         "decoder_prompt_heads": args.decoder_prompt_heads,
         "decoder_prompt_dropout": args.decoder_prompt_dropout,
         "decoder_prompt_insert": args.decoder_prompt_insert,
+        "decoder_prompt_special_tokens": args.decoder_prompt_special_tokens,
         "decoder_prompt_missing": args.decoder_prompt_missing,
         "enable_decoder_lora": bool(args.enable_decoder_lora),
         "lora_rank": args.lora_rank,
@@ -525,6 +544,7 @@ def build_resume_compat_config(
         "loss_rank_margin": args.loss_rank_margin,
         "visual_token_weighting": args.visual_token_weighting,
         "visual_token_weight": args.visual_token_weight,
+        "allow_missing_visual_pos_mask": bool(args.allow_missing_visual_pos_mask),
     }
 
 
@@ -755,8 +775,17 @@ def main() -> None:
         raise ValueError("--resume-from and --init-from cannot be used together.")
     if args.loss_rank_shuffle and args.batch_size < 2:
         print("[WARN] rank loss is disabled for batches smaller than 2")
+    if args.decoder_prompt_special_tokens < -1:
+        raise ValueError("--decoder-prompt-special-tokens must be -1 or non-negative")
     if args.visual_token_weighting == "pos":
-        print("[WARN] POS token weighting needs visual_pos_mask in the batch; absent masks fall back to unit weights")
+        print(
+            "[INFO] POS token weighting requires an aligned visual_pos_mask on every row"
+            + (
+                "; explicit missing-mask fallback is enabled"
+                if args.allow_missing_visual_pos_mask
+                else ""
+            )
+        )
     set_random_seed(args.seed)
 
     train_manifest_path = resolve_cross_platform_path(args.train_manifest)
@@ -839,6 +868,11 @@ def main() -> None:
         decoder_prompt_heads=args.decoder_prompt_heads,
         decoder_prompt_dropout=args.decoder_prompt_dropout,
         decoder_prompt_insert=args.decoder_prompt_insert,
+        decoder_prompt_special_tokens=(
+            None
+            if args.decoder_prompt_special_tokens < 0
+            else args.decoder_prompt_special_tokens
+        ),
         decoder_prompt_missing=args.decoder_prompt_missing,
         blip2_model_name=args.blip2_model_name,
         freeze_visual_encoder=args.freeze_visual_encoder,
@@ -857,6 +891,12 @@ def main() -> None:
         freeze_visual_encoder=args.freeze_visual_encoder,
     )
     tokenizer, prefix_tokens = build_tokenizer_and_prefix(model)
+    resolved_special_token_count = (
+        len(prefix_tokens)
+        if args.decoder_prompt_special_tokens < 0
+        else args.decoder_prompt_special_tokens
+    )
+    model.set_decoder_prompt_special_token_count(resolved_special_token_count)
 
     if args.visual_encoder == "resnet_gmlp" and args.num_gmlp_layers > 0:
         print(
@@ -873,9 +913,20 @@ def main() -> None:
             "Pass --clip-return-sequence to use CLIP patch tokens."
         )
 
+    available_text_ctx = model.dims.n_text_ctx - (
+        model.decoder_prompt_len
+        if model.fusion_location == "decoder_prefix"
+        and model.visual_prompt_adapter is not None
+        else 0
+    )
+    if available_text_ctx <= len(prefix_tokens):
+        raise ValueError(
+            f"decoder prompt leaves only {available_text_ctx} text positions, but "
+            f"the Whisper special-token prefix needs {len(prefix_tokens)}"
+        )
     batch_config = BatchEncodingConfig(
         n_mels=model.dims.n_mels,
-        max_text_ctx=model.dims.n_text_ctx,
+        max_text_ctx=available_text_ctx,
         pad_token_id=tokenizer.eot,
         prefix_tokens=prefix_tokens,
         tokenizer=tokenizer,
@@ -930,6 +981,8 @@ def main() -> None:
         "decoder_prompt_heads": args.decoder_prompt_heads,
         "decoder_prompt_dropout": args.decoder_prompt_dropout,
         "decoder_prompt_insert": args.decoder_prompt_insert,
+        "decoder_prompt_special_tokens": args.decoder_prompt_special_tokens,
+        "resolved_decoder_prompt_special_tokens": resolved_special_token_count,
         "decoder_prompt_missing": args.decoder_prompt_missing,
         "blip2_model_name": args.blip2_model_name,
         "freeze_whisper": bool(args.freeze_whisper),
@@ -946,6 +999,7 @@ def main() -> None:
         "loss_rank_margin": args.loss_rank_margin,
         "visual_token_weighting": args.visual_token_weighting,
         "visual_token_weight": args.visual_token_weight,
+        "allow_missing_visual_pos_mask": bool(args.allow_missing_visual_pos_mask),
     }
     (output_root / "train_config.json").write_text(
         json.dumps(run_config, ensure_ascii=False, indent=2),
@@ -1116,6 +1170,7 @@ def main() -> None:
                         loss_rank_margin=args.loss_rank_margin,
                         visual_token_weighting=args.visual_token_weighting,
                         visual_token_weight=args.visual_token_weight,
+                        allow_missing_visual_pos_mask=args.allow_missing_visual_pos_mask,
                     )
                     loss = loss_metrics["loss"]
                     loss.backward()
