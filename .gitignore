@@ -1,0 +1,46 @@
+# Model weights and training checkpoints
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.checkpoint
+
+# Model/data caches and experiment products
+hf_bundle/
+**/hf_bundle/
+.cache/
+**/.cache/
+huggingface/
+**/huggingface/
+checkpoints/
+**/checkpoints/
+ckpt/
+**/ckpt/
+runs/
+**/runs/
+outputs/
+**/outputs/
+wandb/
+**/wandb/
+hf_cache/
+**/hf_cache/
+
+# Local datasets and generated media/features
+data/
+datasets/
+*.npy
+*.npz
+*.h5
+*.hdf5
+
+# Python/editor artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+.idea/
+.vscode/
