@@ -379,6 +379,108 @@ class BlankDecoderPrefix(nn.Module):
         return self.prefix.expand(batch_size, -1, -1)
 
 
+class ZeroInitImageDeltaPromptAdapter(nn.Module):
+    """Map visual features to a decoder-prefix delta with zero initial output."""
+
+    def __init__(
+        self,
+        dim_visual: int,
+        dim_text: int,
+        num_queries: int = 16,
+        num_heads: int = 8,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        if num_queries <= 0:
+            raise ValueError("num_queries must be positive")
+        if dim_text % num_heads != 0:
+            raise ValueError(
+                f"dim_text ({dim_text}) must be divisible by num_heads ({num_heads})"
+            )
+        self.num_queries = num_queries
+        self.visual_proj = nn.Linear(dim_visual, dim_text)
+        self.visual_norm = DTypeAwareLayerNorm(dim_text)
+        self.queries = nn.Parameter(torch.empty(1, num_queries, dim_text))
+        self.attn = nn.MultiheadAttention(
+            dim_text, num_heads, dropout=dropout, batch_first=True
+        )
+        self.attn_norm = DTypeAwareLayerNorm(dim_text)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim_text, dim_text * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_text * 4, dim_text),
+        )
+        self.mlp_norm = DTypeAwareLayerNorm(dim_text)
+        self.out_proj = nn.Linear(dim_text, dim_text)
+        nn.init.normal_(self.queries, std=0.02)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, visual_features: Tensor) -> Tensor:
+        visual_seq = _visual_to_sequence(visual_features).float()
+        visual_seq = self.visual_norm(self.visual_proj(visual_seq))
+        queries = self.queries.expand(visual_seq.shape[0], -1, -1)
+        attended, _ = self.attn(
+            query=queries,
+            key=visual_seq,
+            value=visual_seq,
+            need_weights=False,
+        )
+        output = self.attn_norm(queries + attended)
+        output = self.mlp_norm(output + self.mlp(output))
+        return self.out_proj(output)
+
+
+class DomainDeltaPromptAdapter(nn.Module):
+    """Frozen domain prefix plus a trainable image-conditioned delta prefix."""
+
+    freeze_domain_prefix = True
+
+    def __init__(
+        self,
+        dim_visual: int,
+        dim_text: int,
+        num_queries: int = 16,
+        num_heads: int = 8,
+        dropout: float = 0.1,
+        delta_scale: float = 1.0,
+    ):
+        super().__init__()
+        if num_queries <= 0:
+            raise ValueError("num_queries must be positive")
+        self.num_queries = num_queries
+        self.delta_scale = float(delta_scale)
+        self.domain_prefix = nn.Parameter(
+            torch.zeros(1, num_queries, dim_text), requires_grad=False
+        )
+        self.image_delta_adapter = ZeroInitImageDeltaPromptAdapter(
+            dim_visual=dim_visual,
+            dim_text=dim_text,
+            num_queries=num_queries,
+            num_heads=num_heads,
+            dropout=dropout,
+        )
+
+    def load_domain_prefix(self, prefix: Tensor) -> None:
+        if prefix.dim() == 2:
+            prefix = prefix.unsqueeze(0)
+        if prefix.shape != self.domain_prefix.shape:
+            raise ValueError(
+                f"domain prefix shape {tuple(prefix.shape)} does not match "
+                f"{tuple(self.domain_prefix.shape)}"
+            )
+        with torch.no_grad():
+            self.domain_prefix.copy_(prefix.detach().to(self.domain_prefix))
+        self.domain_prefix.requires_grad = False
+
+    def forward(self, visual_features: Tensor) -> Tensor:
+        batch_size = visual_features.shape[0]
+        domain = self.domain_prefix.expand(batch_size, -1, -1)
+        delta = self.image_delta_adapter(visual_features)
+        return domain + self.delta_scale * delta
+
+
 class Blip2QFormerPromptAdapter(nn.Module):
     """Use a locally available BLIP-2 Q-Former as a visual prompt resampler.
 
@@ -451,6 +553,7 @@ def build_visual_prompt_adapter(
     num_heads: int = 8,
     dropout: float = 0.1,
     blip2_model_name: str = "",
+    domain_delta_scale: float = 1.0,
 ) -> Optional[nn.Module]:
     """Build a decoder visual-prompt adapter without downloading checkpoints."""
 
@@ -467,6 +570,15 @@ def build_visual_prompt_adapter(
             num_heads=num_heads,
             dropout=dropout,
             use_mlp=True,
+        )
+    if key == "domain_delta_resampler":
+        return DomainDeltaPromptAdapter(
+            dim_visual=dim_visual,
+            dim_text=dim_text,
+            num_queries=num_queries,
+            num_heads=num_heads,
+            dropout=dropout,
+            delta_scale=domain_delta_scale,
         )
     if key == "blip2_qformer":
         return Blip2QFormerPromptAdapter(

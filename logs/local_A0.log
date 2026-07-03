@@ -1,0 +1,1 @@
+scripts/run_flickr8k_decoder_prompt_experiments.sh: line 6: TRAIN_MANIFEST: Set TRAIN_MANIFEST

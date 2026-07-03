@@ -21,6 +21,14 @@ runs/
 **/runs/
 outputs/
 **/outputs/
+predictions/
+**/predictions/
+nbest/
+**/nbest/
+rerank_outputs/
+**/rerank_outputs/
+*.pkl
+*.joblib
 wandb/
 **/wandb/
 hf_cache/

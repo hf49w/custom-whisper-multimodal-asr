@@ -220,6 +220,7 @@ def load_audio_image_model(
     decoder_prompt_special_tokens: Optional[int] = None,
     decoder_prompt_missing: str = "audio_only",
     blip2_model_name: str = "",
+    domain_delta_scale: float = 1.0,
     freeze_visual_encoder: bool = False,
     freeze_whisper: bool = False,
     visual_local_files_only: bool = False,
@@ -276,6 +277,7 @@ def load_audio_image_model(
         decoder_prompt_special_tokens=decoder_prompt_special_tokens,
         decoder_prompt_missing=decoder_prompt_missing,
         blip2_model_name=blip2_model_name,
+        domain_delta_scale=domain_delta_scale,
         freeze_visual_encoder=False,
         freeze_whisper=False,
         visual_local_files_only=visual_local_files_only,
@@ -310,6 +312,7 @@ def load_audio_image_model(
             "freeze_whisper": freeze_whisper,
             "freeze_visual_encoder": freeze_visual_encoder,
             "enable_decoder_lora": enable_decoder_lora,
+            "domain_delta_scale": domain_delta_scale,
         }
     )
     if freeze_whisper or freeze_visual_encoder:

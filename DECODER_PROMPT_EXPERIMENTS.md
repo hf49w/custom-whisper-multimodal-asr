@@ -98,3 +98,64 @@ BLIP-2 Q-Former support is optional and local-only. It loads a local
 precomputed visual sequences to Whisper prompts. If `transformers` or the local
 checkpoint is absent, model construction fails with an actionable error. No
 large model is downloaded automatically when `--no-download` is used.
+
+## A9 candidate reranking
+
+A9 does not change or retrain the ASR model. It reuses an existing checkpoint
+and only changes how n-best decode candidates are selected. The intended use is
+with the A1 blank decoder-prefix checkpoint and the same decode-only path as
+`eval_decode_only_oracle_rerank.py`.
+
+Dump validation and test candidates:
+
+```bash
+python scripts/dump_nbest_candidates.py \
+  --checkpoint-path /path/A1/checkpoints/best_val_loss.pt \
+  --manifest-path /path/val_manifest.jsonl \
+  --beam-size 20 --n-best 20 \
+  --output-jsonl /path/a9/val_beam20_nbest.jsonl \
+  --device cuda --no-download
+
+python scripts/dump_nbest_candidates.py \
+  --checkpoint-path /path/A1/checkpoints/best_val_loss.pt \
+  --manifest-path /path/test_manifest.jsonl \
+  --beam-size 20 --n-best 20 \
+  --output-jsonl /path/a9/test_beam20_nbest.jsonl \
+  --device cuda --no-download
+```
+
+Run untrained ASR/CLIP/MBR/length grid reranking:
+
+```bash
+python scripts/rerank_nbest_candidates.py \
+  --input-jsonl /path/a9/test_beam20_nbest.jsonl \
+  --output-dir /path/a9/mbr_grid_test_beam20 \
+  --clip-model-name /path/clip-vit-base-patch32 \
+  --device cuda --no-download
+```
+
+Train a validation-set reranker:
+
+```bash
+python scripts/train_candidate_reranker.py \
+  --val-jsonl /path/a9/val_beam20_nbest.jsonl \
+  --output-pkl /path/a9/reranker_beam20.pkl \
+  --output-dir /path/a9/train_reranker_beam20 \
+  --clip-model-name /path/clip-vit-base-patch32 \
+  --device cuda --no-download
+```
+
+Evaluate the trained reranker on test candidates:
+
+```bash
+python scripts/eval_candidate_reranker.py \
+  --test-jsonl /path/a9/test_beam20_nbest.jsonl \
+  --reranker-pkl /path/a9/reranker_beam20.pkl \
+  --output-dir /path/a9/eval_reranker_beam20 \
+  --device cuda --no-download
+```
+
+The A9 reports include top-1 WER/CER, top-k oracle curves for
+`k=1,5,10,20,30,50`, MBR/grid metrics, validation cross-validation metrics for
+the trained reranker, selected predictions, error cases, and samples where the
+oracle could fix top-1 but the reranker did not select that candidate.

@@ -78,6 +78,8 @@ RESUME_COMPAT_KEYS = (
     "decoder_prompt_insert",
     "decoder_prompt_special_tokens",
     "decoder_prompt_missing",
+    "domain_delta_scale",
+    "domain_prefix_from",
     "enable_decoder_lora",
     "lora_rank",
     "lora_alpha",
@@ -109,6 +111,8 @@ LEGACY_RESUME_DEFAULTS = {
     "decoder_prompt_insert": "before_tokens",
     "decoder_prompt_special_tokens": -1,
     "decoder_prompt_missing": "audio_only",
+    "domain_delta_scale": 1.0,
+    "domain_prefix_from": "",
     "enable_decoder_lora": False,
     "lora_rank": 4,
     "lora_alpha": 16.0,
@@ -128,6 +132,7 @@ RELOCATABLE_PATH_KEYS = {
     "val_manifest",
     "clip_model_name",
     "blip2_model_name",
+    "domain_prefix_from",
 }
 
 
@@ -309,7 +314,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--decoder-prompt-adapter",
-        choices=["none", "blank_prefix", "resampler", "qformer_like", "blip2_qformer"],
+        choices=[
+            "none",
+            "blank_prefix",
+            "resampler",
+            "qformer_like",
+            "blip2_qformer",
+            "domain_delta_resampler",
+        ],
         default="none",
     )
     parser.add_argument("--decoder-prompt-len", type=int, default=16)
@@ -334,6 +346,13 @@ def parse_args() -> argparse.Namespace:
         choices=["audio_only", "error"],
         default="audio_only",
     )
+    parser.add_argument(
+        "--domain-prefix-from",
+        type=str,
+        default="",
+        help="A1 blank-prefix checkpoint used to initialize frozen domain prefix for domain_delta_resampler.",
+    )
+    parser.add_argument("--domain-delta-scale", type=float, default=1.0)
     parser.set_defaults(freeze_whisper=True, freeze_visual_encoder=True)
     parser.add_argument("--freeze-whisper", dest="freeze_whisper", action="store_true")
     parser.add_argument("--no-freeze-whisper", dest="freeze_whisper", action="store_false")
@@ -533,6 +552,8 @@ def build_resume_compat_config(
         "decoder_prompt_insert": args.decoder_prompt_insert,
         "decoder_prompt_special_tokens": args.decoder_prompt_special_tokens,
         "decoder_prompt_missing": args.decoder_prompt_missing,
+        "domain_delta_scale": args.domain_delta_scale,
+        "domain_prefix_from": args.domain_prefix_from,
         "enable_decoder_lora": bool(args.enable_decoder_lora),
         "lora_rank": args.lora_rank,
         "lora_alpha": args.lora_alpha,
@@ -582,6 +603,28 @@ def validate_resume_checkpoint(
         raise ValueError(
             f"Resume checkpoint is incompatible with current training arguments: {mismatch_text}"
         )
+
+
+def load_domain_prefix_from_checkpoint(
+    model: custom_whisper.AudioImageWhisper,
+    checkpoint_path: Path,
+) -> None:
+    adapter = getattr(model, "visual_prompt_adapter", None)
+    if adapter is None or not hasattr(adapter, "load_domain_prefix"):
+        raise ValueError(
+            "--domain-prefix-from requires decoder_prompt_adapter='domain_delta_resampler'"
+        )
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    state = checkpoint.get("visual_prompt_adapter_state_dict")
+    prefix = None
+    if isinstance(state, dict):
+        prefix = state.get("prefix")
+    lightweight_state = checkpoint.get("lightweight_state_dict")
+    if prefix is None and isinstance(lightweight_state, dict):
+        prefix = lightweight_state.get("visual_prompt_adapter.prefix")
+    if prefix is None:
+        raise ValueError(f"Could not find A1 blank prefix in checkpoint: {checkpoint_path}")
+    adapter.load_domain_prefix(prefix)
 
 
 def infer_best_loss(history: List[Dict[str, Any]]) -> float:
@@ -802,6 +845,22 @@ def main() -> None:
     init_from_path = resolve_cross_platform_path(args.init_from) if args.init_from else None
     if init_from_path is not None and not init_from_path.is_file():
         raise FileNotFoundError(f"Initialization checkpoint not found: {init_from_path}")
+    domain_prefix_from_path = (
+        resolve_cross_platform_path(args.domain_prefix_from)
+        if args.domain_prefix_from
+        else None
+    )
+    if domain_prefix_from_path is not None and not domain_prefix_from_path.is_file():
+        raise FileNotFoundError(f"Domain-prefix checkpoint not found: {domain_prefix_from_path}")
+    if (
+        args.decoder_prompt_adapter == "domain_delta_resampler"
+        and domain_prefix_from_path is None
+        and resume_from_path is None
+    ):
+        raise ValueError(
+            "--decoder-prompt-adapter domain_delta_resampler requires --domain-prefix-from "
+            "for a fresh run"
+        )
     if args.force_retrain:
         print(f"[INFO] force_retrain=1 clearing previous training artifacts under {output_root}")
         cleanup_training_artifacts(output_root, checkpoints_dir)
@@ -875,6 +934,7 @@ def main() -> None:
         ),
         decoder_prompt_missing=args.decoder_prompt_missing,
         blip2_model_name=args.blip2_model_name,
+        domain_delta_scale=args.domain_delta_scale,
         freeze_visual_encoder=args.freeze_visual_encoder,
         freeze_whisper=args.freeze_whisper,
         visual_local_files_only=args.no_download,
@@ -985,6 +1045,8 @@ def main() -> None:
         "resolved_decoder_prompt_special_tokens": resolved_special_token_count,
         "decoder_prompt_missing": args.decoder_prompt_missing,
         "blip2_model_name": args.blip2_model_name,
+        "domain_delta_scale": args.domain_delta_scale,
+        "domain_prefix_from": args.domain_prefix_from,
         "freeze_whisper": bool(args.freeze_whisper),
         "freeze_visual_encoder": bool(args.freeze_visual_encoder),
         "no_download": bool(args.no_download),
@@ -1057,6 +1119,10 @@ def main() -> None:
         else:
             raise ValueError(f"No compatible lightweight state found in {init_from_path}")
 
+    if resume_checkpoint is None and domain_prefix_from_path is not None:
+        load_domain_prefix_from_checkpoint(model, domain_prefix_from_path)
+        freeze_stats = model.trainable_parameter_summary()
+
     print(f"[INFO] device={device}")
     print(f"[INFO] train_rows={len(train_rows)}")
     if val_manifest_path is not None:
@@ -1081,6 +1147,8 @@ def main() -> None:
     )
     if specaug_config is not None:
         print(f"[INFO] specaug={specaug_config.to_dict()}")
+    if domain_prefix_from_path is not None:
+        print(f"[INFO] domain_prefix_from={domain_prefix_from_path}")
     if resume_from_path is not None:
         completed_epochs = start_epoch - 1
         print(f"[INFO] resume_from={resume_from_path}")

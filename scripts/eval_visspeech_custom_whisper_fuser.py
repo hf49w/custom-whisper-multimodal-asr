@@ -200,6 +200,7 @@ def rebuild_model(
         decoder_prompt_special_tokens=special_token_count,
         decoder_prompt_missing=config.get("decoder_prompt_missing", "audio_only"),
         blip2_model_name=config.get("blip2_model_name", ""),
+        domain_delta_scale=config.get("domain_delta_scale", 1.0),
         freeze_whisper=True,
         freeze_visual_encoder=True,
         visual_local_files_only=no_download,

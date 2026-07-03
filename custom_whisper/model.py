@@ -107,7 +107,10 @@ class LoRALinear(Linear):
 
     def forward(self, x: Tensor) -> Tensor:
         base = super().forward(x)
-        update = F.linear(F.linear(self.lora_dropout(x), self.lora_A), self.lora_B)
+        lora_input = self.lora_dropout(x)
+        lora_a = self.lora_A.to(lora_input.dtype)
+        lora_b = self.lora_B.to(lora_input.dtype)
+        update = F.linear(F.linear(lora_input, lora_a), lora_b)
         return base + update.to(base.dtype) * self.scaling
 
 
@@ -569,6 +572,7 @@ class AudioImageWhisper(Whisper):
         decoder_prompt_special_tokens: Optional[int] = None,
         decoder_prompt_missing: str = "audio_only",
         blip2_model_name: str = "",
+        domain_delta_scale: float = 1.0,
         freeze_visual_encoder: bool = False,
         freeze_whisper: bool = False,
         visual_local_files_only: bool = False,
@@ -624,6 +628,7 @@ class AudioImageWhisper(Whisper):
             "decoder_prompt_special_tokens": decoder_prompt_special_tokens,
             "decoder_prompt_missing": decoder_prompt_missing,
             "blip2_model_name": blip2_model_name,
+            "domain_delta_scale": domain_delta_scale,
             "freeze_visual_encoder": freeze_visual_encoder,
             "freeze_whisper": freeze_whisper,
             "visual_local_files_only": visual_local_files_only,
@@ -675,6 +680,7 @@ class AudioImageWhisper(Whisper):
             num_heads=decoder_prompt_heads,
             dropout=decoder_prompt_dropout,
             blip2_model_name=blip2_model_name,
+            domain_delta_scale=domain_delta_scale,
         )
         if enable_decoder_lora:
             self.enable_decoder_lora(
@@ -719,8 +725,14 @@ class AudioImageWhisper(Whisper):
             else self.feature_fuser
         )
         if active_module is not None:
-            for parameter in active_module.parameters():
-                parameter.requires_grad = True
+            for name, parameter in active_module.named_parameters():
+                if (
+                    getattr(active_module, "freeze_domain_prefix", False)
+                    and name == "domain_prefix"
+                ):
+                    parameter.requires_grad = False
+                else:
+                    parameter.requires_grad = True
         return self.trainable_parameter_summary()
 
     def trainable_parameter_summary(self) -> Dict[str, int]:
