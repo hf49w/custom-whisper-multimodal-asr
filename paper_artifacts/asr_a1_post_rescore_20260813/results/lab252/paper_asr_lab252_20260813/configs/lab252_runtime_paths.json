@@ -1,0 +1,9 @@
+{
+  "server": "lab-252",
+  "code_root": "/DATA_2/guest/custom-whisper-dev",
+  "base_model_root": "/DATA_2/guest/custom-whisper/data/models",
+  "whisper_large_v3": "/DATA_2/guest/custom-whisper/data/models/whisper/large-v3.pt",
+  "clip_model": "/DATA_2/guest/custom-whisper/data/models/clip/clip-vit-base-patch32",
+  "blip2_model": "/DATA_2/guest/custom-whisper/data/models/blip2/blip2-opt-2.7b",
+  "conda_env": "/DATA_4/guest/envs/custom-whisper-mm"
+}

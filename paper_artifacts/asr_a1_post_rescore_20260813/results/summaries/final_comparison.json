@@ -1,0 +1,35 @@
+{
+  "formal_best": {
+    "name": "A1 beam20 + val-tuned post-rescore reranker",
+    "wer_percent": 2.0713,
+    "cer_percent": 0.8338,
+    "metrics_file": "results/lab250/paper_asr_lab250_20260813/files/outputs/flickr8k_val_tuned_postprocess_20260705/rescore_beam20_val_tuned_extra_grid/metrics.json"
+  },
+  "baseline": {
+    "name": "A0 no-image Whisper beam20 decode-only top1",
+    "wer_percent": 2.6299,
+    "cer_percent": 1.1449,
+    "note": "Computed from A0 beam20 n-best top1 on the same 4000-sample test split."
+  },
+  "relative_improvement_over_baseline": {
+    "wer_relative_reduction_percent": 21.2404,
+    "cer_relative_reduction_percent": 27.1727,
+    "wer_absolute_reduction_points": 0.5586,
+    "cer_absolute_reduction_points": 0.3111
+  },
+  "a1_top1_before_post_rescore": {
+    "wer_percent": 2.1173,
+    "cer_percent": 0.8437
+  },
+  "a1_beam20_oracle": {
+    "wer_percent": 0.6138,
+    "cer_percent": 0.3214
+  },
+  "cieasr_comparison_note": {
+    "cieasr_reported_baseline_wer_percent": 2.42,
+    "cieasr_reported_best_wer_percent": 2.05,
+    "cieasr_relative_wer_reduction_percent": 15.2893,
+    "our_absolute_wer_minus_cieasr_points": 0.0213,
+    "recommended_claim": "Do not claim strict absolute SOTA over CIEASR because splits/checkpoints differ. It is defensible to claim a larger relative WER reduction over the corresponding no-image baseline."
+  }
+}
